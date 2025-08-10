@@ -219,11 +219,8 @@ func DecryptWithPassphrase(key *Key, passphrase string) (wifPrivKey, addr string
 
 	factorb := sha256Twice(seeddb)
 
-	passFactorBig := new(big.Int).SetBytes(passFactor)
-	factorbBig := new(big.Int).SetBytes(factorb)
-
-	privKey := new(big.Int)
-	privKey.Mul(passFactorBig, factorbBig)
+	privKey := new(big.Int).SetBytes(passFactor)
+	privKey.Mul(privKey, new(big.Int).SetBytes(factorb))
 	privKey.Mod(privKey, bigN)
 
 	pubKey, err := btc.PublicFromPrivate(privKey.Bytes(), key.compressed)
