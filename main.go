@@ -73,9 +73,6 @@ Options:
                  resume offset to continue from, as printed onscreen after a ^C
   -i             Use input file reading mode. Next argument should be a
                  filename to read.  See <input_file> above.
-  -s             When using <input_file> reading mode, specifies that leading
-                 and trailing whitespace should NOT be trimmed from each
-                 password that will be tried (default is to trim).
   -h             Usage Help
   
 Examples:
@@ -110,7 +107,6 @@ func main() {
 	chunk := 0
 	charset := "" // use default
 	infile := ""
-	notrim := false
 	coin := supportedCoins[defaultCoin] // default is BTC
 
 	if arguments["--chunk"] != nil {
@@ -154,12 +150,7 @@ func main() {
 	if arguments["-i"] != nil && arguments["-i"].(bool) {
 		infile = arguments["<input_file>"].(string)
 	}
-	if arguments["-s"] != nil && arguments["-s"].(bool) {
-		if infile == "" {
-			log.Fatal("Option -s can only be used if using -i mode!")
-		}
-		notrim = true
-	}
+
 	if arguments["--charset"] != nil {
 		if infile != "" {
 			log.Fatal("--charset argument cannot be combined with -i!")
@@ -199,14 +190,6 @@ func main() {
 		}
 	}
 
-	var lines []string = nil
-	if infile != "" {
-		fmt.Printf("Reading password file into memory: %s...\n", infile)
-		var mem uint64
-		lines, mem = readAllLines(infile, !notrim)
-		fmt.Printf("%s memory used for password file data\n", prettyFormatMem(mem))
-	}
-
 	ncpu := runtime.NumCPU()
 	if arguments["-t"] != nil {
 		ncpu, _ = strconv.Atoi(arguments["-t"].(string))
@@ -217,7 +200,7 @@ func main() {
 	}
 	fmt.Printf("Running brute force for BIP38-encrypted key on %d CPUs\n", ncpu)
 	runtime.GOMAXPROCS(ncpu)
-	result := bip38.BruteChunk(ncpu, priv, charset, pwlen, pat, lines, chunk, chunks, resume, [2]byte{coin.networkVersion, coin.privateKeyPrefix}, coin.name)
+	result := bip38.BruteChunk(ncpu, priv, charset, infile, pwlen, pat, chunk, chunks, resume, [2]byte{coin.networkVersion, coin.privateKeyPrefix}, coin.name)
 	if result == "" {
 		fmt.Printf("\nNot found.\n")
 		os.Exit(2)

@@ -1,198 +1,277 @@
 package bip38
 
 import (
+	"bufio"
 	"fmt"
 	"log"
 	"math"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync/atomic"
 )
 
 var totalTried uint64 = 0
 var stopSearch int32 = 0
 
-func tryPasswords(start, finish uint64, key *Key, passwords []string, c chan string) {
-	var i uint64
-	if finish > uint64(len(passwords)) {
-		log.Fatal("INTERNAL ERROR: tryPasswords -- finish > len(passwords)!")
+func tryPasswords(start, finish uint64, key *Key, passwords <-chan string, c chan string) {
+	if key == nil {
+		log.Fatal("Invalid key: nil pointer")
 	}
-	for i = start; atomic.LoadInt32(&stopSearch) == 0 && i < finish; i++ {
-		privKey, addr := DecryptWithPassphrase(key, passwords[i])
-		if privKey != "" {
-			c <- privKey + "    pass = '" + passwords[i] + "'   ( Address: " + addr + " )"
+	var b strings.Builder
+	b.Grow(128) // Estimate: 52 (WIF) + 20 (passphrase) + 34 (address) + 22 (formatting)
+	for i := start; i < finish && atomic.LoadInt32(&stopSearch) == 0; i++ {
+		password, ok := <-passwords
+		if !ok {
+			c <- ""
 			return
 		}
-
+		privKey, addr := DecryptWithPassphrase(key, password)
+		if privKey != "" {
+			b.Reset()
+			b.WriteString(privKey)
+			b.WriteString("    pass = '")
+			b.WriteString(password)
+			b.WriteString("'   ( Address: ")
+			b.WriteString(addr)
+			b.WriteString(" )")
+			c <- b.String()
+			return
+		}
 		atomic.AddUint64(&totalTried, 1)
-
-		fmt.Printf("%6d passphrases tried (latest guess: %s )                       \r", atomic.LoadUint64(&totalTried), passwords[i])
+		if i%100 == 0 {
+			fmt.Printf("%6d passphrases tried (latest guess: %s )                       \r", atomic.LoadUint64(&totalTried), password)
+		}
 	}
 	if atomic.LoadInt32(&stopSearch) != 0 {
-		c <- fmt.Sprintf("%d", i-start) // interrupt signal received, announce our position for the resume code
+		c <- fmt.Sprintf("%d", finish-start)
 		return
 	}
 	c <- ""
 }
 
 func searchRange(start, finish uint64, key *Key, charset string, pwlen int, pat []rune, c chan string) {
+	if key == nil || charset == "" || len(pat) == 0 || start > finish {
+		log.Fatal("Invalid input: nil key, empty charset, empty pattern, or invalid range")
+	}
 	cset := []rune(charset)
-	var i uint64
-
-	var guess []rune = make([]rune, len(pat))
-
-	for i = start; atomic.LoadInt32(&stopSearch) == 0 && i < finish; i++ {
+	csetLen := uint64(len(cset))
+	if csetLen == 0 {
+		log.Fatal("Empty charset")
+	}
+	var b strings.Builder
+	b.Grow(128) // Estimate: 52 (WIF) + 20 (passphrase) + 34 (address) + 22 (formatting)
+	guess := make([]rune, len(pat))
+	for i := start; i < finish && atomic.LoadInt32(&stopSearch) == 0; i++ {
 		acum := i
 		for j := 0; j < len(pat); j++ {
 			if pat[j] == '?' {
-				guess[j] = cset[acum%uint64(len(cset))]
-				acum /= uint64(len(cset))
+				guess[j] = cset[acum%csetLen]
+				acum /= csetLen
 			} else {
 				guess[j] = pat[j]
 			}
 		}
-		guessString := string(guess)
+		b.Reset()
+		b.WriteString(string(guess))
+		guessString := b.String()
 		privKey, addr := DecryptWithPassphrase(key, guessString)
 		if privKey != "" {
-			c <- privKey + "    pass = '" + guessString + "'   ( Address: " + addr + " )"
+			b.Reset()
+			b.WriteString(privKey)
+			b.WriteString("    pass = '")
+			b.WriteString(guessString)
+			b.WriteString("'   ( Address: ")
+			b.WriteString(addr)
+			b.WriteString(" )")
+			c <- b.String()
 			return
 		}
-
 		atomic.AddUint64(&totalTried, 1)
-
-		fmt.Printf("%6d passphrases tried (latest guess: %s )                      \r", atomic.LoadUint64(&totalTried), guessString)
+		// Optional: Uncomment for throttled progress output
+		if i%100 == 0 {
+			fmt.Printf("%6d passphrases tried (latest guess: %s )                      \r", atomic.LoadUint64(&totalTried), guessString)
+		}
 	}
 	if atomic.LoadInt32(&stopSearch) != 0 {
-		c <- fmt.Sprintf("%d", i-start) // interrupt signal received, announce our position for the resume code
+		c <- fmt.Sprintf("%d", finish-start)
 		return
 	}
 	c <- ""
 }
-
-func BruteChunk(routines int, encryptedKey, charset string, pwlen int, pat string, passwords []string, chunk, chunks int, resume uint64, coinInfo [2]byte, coinName string) string {
+func BruteChunk(routines int, encryptedKey, charset, passwordFile string, pwlen int, pat string, chunk, chunks int, resume uint64, coinInfo [2]byte, coinName string) string {
 	if chunk < 0 || chunks <= 0 || chunk >= chunks {
-		log.Fatal("chunk/chunks specification invalid")
+		log.Fatal("Invalid chunk specification")
 	}
 	if encryptedKey == "" {
-		log.Fatal("encryptedKey required")
+		log.Fatal("Empty encryptedKey")
 	}
-
+	if routines < 1 {
+		log.Fatal("Routines must be >= 1")
+	}
+	if pwlen < 1 && passwordFile == "" {
+		log.Fatal("Password length must be >= 1 or password file must be provided")
+	}
+	if coinName == "" {
+		log.Fatal("Empty coinName")
+	}
 	key := NewKey(encryptedKey)
-
 	key.networkVersion = coinInfo[0]
 	key.privateKeyPrefix = coinInfo[1]
-
-	if routines < 1 {
-		log.Fatal("routines must be >= 1")
-	}
-
-	if pwlen < 1 && passwords == nil {
-		log.Fatal("pw length must be >= 1")
-	}
-
-	// Extended ASCII
-	//charset := " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~.€.‚ƒ„…†‡ˆ‰Š‹Œ.Ž..‘’“”•–—˜™š›œ.žŸ ¡¢£¤¥¦§¨©ª«¬­®¯°±²³´µ¶·¸¹º»¼½¾¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿ"
-
-	// Printable ASCII
-	if charset == "" && passwords == nil {
+	var b strings.Builder
+	b.Grow(256) // Estimate for config output
+	if charset == "" && passwordFile == "" {
 		charset = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~."
 	}
-
 	if charset != "" {
-		fmt.Printf("Using character set: %s\n", charset)
+		b.WriteString("Using character set: ")
+		b.WriteString(charset)
+		b.WriteByte('\n')
 	}
-	fmt.Printf("Encrypted key: %s\nKeyType: %s\nNetwork: %s\n", encryptedKey, key.TypeString(), coinName)
-
-	spaceSize := uint64(math.Pow(float64(len(charset)), float64(pwlen)))
-
-	if passwords == nil {
-		if len([]rune(pat)) != 0 {
-			fmt.Printf("Pattern: %s\n", pat)
-			fmt.Printf("Unknown chars: %d\n", pwlen)
-			fmt.Printf("Password length: %d\n", len([]rune(pat)))
-		} else {
-			pat = ""
-			for i := 0; i < pwlen; i++ {
-				pat = pat + "?"
+	b.WriteString("Encrypted key: ")
+	b.WriteString(encryptedKey)
+	b.WriteString("\nKeyType: ")
+	b.WriteString(key.TypeString())
+	b.WriteString("\nNetwork: ")
+	b.WriteString(coinName)
+	b.WriteByte('\n')
+	var spaceSize uint64
+	var patAsRunes []rune
+	if passwordFile == "" {
+		if pat == "" {
+			patAsRunes = make([]rune, pwlen)
+			for i := range patAsRunes {
+				patAsRunes[i] = '?'
 			}
-			fmt.Printf("Password length: %d\n", pwlen)
+			b.WriteString("Password length: ")
+			b.WriteString(strconv.Itoa(pwlen))
+			b.WriteByte('\n')
+		} else {
+			patAsRunes = []rune(pat)
+			if len(patAsRunes) == 0 {
+				log.Fatal("Empty pattern")
+			}
+			b.WriteString("Pattern: ")
+			b.WriteString(pat)
+			b.WriteString("\nUnknown chars: ")
+			b.WriteString(strconv.Itoa(pwlen))
+			b.WriteString("\nPassword length: ")
+			b.WriteString(strconv.Itoa(len(patAsRunes)))
+			b.WriteByte('\n')
 		}
-		fmt.Printf("Total passphrase space size: %d\n", spaceSize)
+		csetLen := uint64(len([]rune(charset)))
+		if csetLen == 0 {
+			log.Fatal("Empty charset")
+		}
+		spaceSize = 1
+		for i := 0; i < pwlen; i++ {
+			spaceSize *= csetLen
+		}
+		b.WriteString("Total passphrase space size: ")
+		b.WriteString(strconv.FormatUint(spaceSize, 10))
+		b.WriteByte('\n')
 	} else {
-		spaceSize = uint64(len(passwords))
-		fmt.Printf("Number of passphrases to try: %d\n", len(passwords))
+		// For file, we don't know spaceSize upfront; estimate or skip
+		spaceSize = math.MaxUint64 // Placeholder for chunking
+		b.WriteString("Password file: ")
+		b.WriteString(passwordFile)
+		b.WriteByte('\n')
 	}
-
-	patAsRunes := []rune(pat)
+	fmt.Print(b.String())
 	startFrom := uint64(0)
 	chunkSize := spaceSize / uint64(chunks)
-	blockSize := uint64(chunkSize / uint64(routines))
+	blockSize := chunkSize / uint64(routines)
 	if chunks > 1 {
 		startFrom = chunkSize * uint64(chunk)
 		csz := chunkSize
 		if chunk == chunks-1 {
 			csz = spaceSize - startFrom
 		}
-		fmt.Printf("Chunk passphrase space size: %d  Starting from point: %d\n", csz, startFrom)
+		b.Reset()
+		b.WriteString("Chunk passphrase space size: ")
+		b.WriteString(strconv.FormatUint(csz, 10))
+		b.WriteString("  Starting from point: ")
+		b.WriteString(strconv.FormatUint(startFrom, 10))
+		b.WriteByte('\n')
+		fmt.Print(b.String())
 	}
-
 	totalTried = resume * uint64(routines)
-	c := make(chan string)
-
+	c := make(chan string, routines)
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, os.Interrupt)
 	defer signal.Stop(sigc)
-
-	for i := 0; i < routines; i++ {
-		var finish uint64
-		if i == routines-1 {
-			// Last block needs to go right to the end of the search space
-			finish = chunkSize + startFrom
-			if chunk == chunks-1 {
-				finish = spaceSize
-			}
-		} else {
-			finish = uint64(i)*blockSize + blockSize + startFrom
+	if passwordFile != "" {
+		file, err := os.Open(passwordFile)
+		if err != nil {
+			log.Fatalf("Failed to open password file: %v", err)
 		}
-		start := uint64(i)*blockSize + startFrom + resume
-
-		if passwords == nil {
+		defer file.Close()
+		pwdChan := make(chan string, routines*100) // Buffer to reduce contention
+		go func() {
+			defer close(pwdChan)
+			scanner := bufio.NewScanner(file)
+			scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // 64KB initial, 1MB max
+			for i := uint64(0); scanner.Scan() && atomic.LoadInt32(&stopSearch) == 0; i++ {
+				if i < startFrom+resume {
+					continue // Skip to resume point
+				}
+				pwdChan <- scanner.Text()
+			}
+			if err := scanner.Err(); err != nil {
+				log.Printf("Error reading password file: %v", err)
+			}
+		}()
+		for i := 0; i < routines; i++ {
+			finish := uint64(i)*blockSize + blockSize + startFrom
+			if i == routines-1 {
+				finish = chunkSize + startFrom
+				if chunk == chunks-1 {
+					finish = spaceSize
+				}
+			}
+			start := uint64(i)*blockSize + startFrom + resume
+			go tryPasswords(start, finish, key, pwdChan, c)
+		}
+	} else {
+		for i := 0; i < routines; i++ {
+			finish := uint64(i)*blockSize + blockSize + startFrom
+			if i == routines-1 {
+				finish = chunkSize + startFrom
+				if chunk == chunks-1 {
+					finish = spaceSize
+				}
+			}
+			start := uint64(i)*blockSize + startFrom + resume
 			go searchRange(start, finish, key, charset, pwlen, patAsRunes, c)
-		} else {
-			go tryPasswords(start, finish, key, passwords, c)
 		}
 	}
-	var minResumeKey uint64 = 0
-	i := routines
-	for {
+	var minResumeKey uint64
+	for i := routines; i > 0; i-- {
 		select {
 		case s := <-c:
 			if s == "" {
-				// a search thread has ended!
-				i--
-				if i <= 0 {
-					return "" // last search thread ended!
-				}
-			} else if atomic.LoadInt32(&stopSearch) != 0 {
-				u, err := strconv.ParseUint(s, 10, 64)
-				if err == nil && (u+resume < minResumeKey || minResumeKey == 0) {
+				continue
+			}
+			if atomic.LoadInt32(&stopSearch) != 0 {
+				if u, err := strconv.ParseUint(s, 10, 64); err == nil && (u+resume < minResumeKey || minResumeKey == 0) {
 					minResumeKey = u + resume
 				} else if err != nil {
-					// happened to crack key on interrupt! return cracked key
 					return s
 				}
-				i--
-				if i <= 0 {
-					return fmt.Sprintf("to resume, use offset %d", minResumeKey)
-				}
-			} else { // found/cracked key! return answer!
-				return s
+				continue
 			}
+			return s
 		case sig := <-sigc:
-			atomic.StoreInt32(&stopSearch, 1) // tell search functions they need to stop
-			fmt.Printf("\n(%s)\n", sig.String())
+			atomic.StoreInt32(&stopSearch, 1)
+			fmt.Printf("\nReceived signal: %s\n", sig)
 		}
 	}
-	return "" // not reached
+	if minResumeKey > 0 {
+		b.Reset()
+		b.WriteString("to resume, use offset ")
+		b.WriteString(strconv.FormatUint(minResumeKey, 10))
+		return b.String()
+	}
+	return ""
 }
