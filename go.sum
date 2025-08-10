@@ -1,0 +1,8 @@
+github.com/cculianu/gocoin v0.0.0-20171223222640-58eb845f5fb4 h1:xL7aydtua2Y/RsucGXxfjm/EnNiqJ9YwyBtuuNLz5NA=
+github.com/cculianu/gocoin v0.0.0-20171223222640-58eb845f5fb4/go.mod h1:pQZGSkt7hGVW/ubUPI3yQ/OqqoInMPLxzqOx9d1zB3c=
+github.com/docopt/docopt.go v0.0.0-20180111231733-ee0de3bc6815 h1:HMAfwOa33y82IaQEKQDfUCiwNlxtM1iw7HLM9ru0RNc=
+github.com/docopt/docopt.go v0.0.0-20180111231733-ee0de3bc6815/go.mod h1:l7JNRynTRuqe45tpIyItHNqZWTxywYjp87MWTOnU5cg=
+github.com/golang/snappy v1.0.0 h1:Oy607GVXHs7RtbggtPBnr2RmDArIsAefDwvrdWvRhGs=
+github.com/golang/snappy v1.0.0/go.mod h1:/XxbfmMg8lxefKM7IXC3fBNl/7bRcc72aCRzEWrmP2Q=
+golang.org/x/crypto v0.41.0 h1:WKYxWedPGCTVVl5+WHSSrOBT0O8lx32+zxmHxijgXp4=
+golang.org/x/crypto v0.41.0/go.mod h1:pO5AFd7FA68rFak7rOAGVuygIISepHftHnr8dr6+sUc=
