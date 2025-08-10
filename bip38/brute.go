@@ -10,25 +10,39 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 var totalTried uint64 = 0
 var stopSearch int32 = 0
 
 func tryPasswords(start, finish uint64, key *Key, passwords <-chan string, c chan string) {
+	startTime := time.Now()
 	if key == nil {
 		log.Fatal("Invalid key: nil pointer")
 	}
 	var b strings.Builder
-	b.Grow(128) // Estimate: 52 (WIF) + 20 (passphrase) + 34 (address) + 22 (formatting)
-	for i := start; i < finish && atomic.LoadInt32(&stopSearch) == 0; i++ {
+	b.Grow(128) // Preallocate buffer to reduce allocations
+
+	for i := start; i < finish; i++ {
+		// Check stop flag once per iteration
+		if atomic.LoadInt32(&stopSearch) != 0 {
+			c <- fmt.Sprintf("%d", i-start)
+			return
+		}
+
 		password, ok := <-passwords
 		if !ok {
+			// Channel closed: no more passwords
 			c <- ""
 			return
 		}
+
 		privKey, addr := DecryptWithPassphrase(key, password)
+		atomic.AddUint64(&totalTried, 1)
+
 		if privKey != "" {
+			// Construct result string without extra allocations
 			b.Reset()
 			b.WriteString(privKey)
 			b.WriteString("    pass = '")
@@ -39,19 +53,27 @@ func tryPasswords(start, finish uint64, key *Key, passwords <-chan string, c cha
 			c <- b.String()
 			return
 		}
-		atomic.AddUint64(&totalTried, 1)
-		if i%100 == 0 {
-			fmt.Printf("%6d passphrases tried (latest guess: %s )                       \r", atomic.LoadUint64(&totalTried), password)
+
+		// Print progress every 1000 attempts to reduce overhead
+		if atomic.LoadUint64(&totalTried)%1000 == 0 {
+			elapsed := time.Since(startTime).Truncate(time.Second)
+			fmt.Printf("%9d passphrases tried (latest guess: %s ) elapsed: %v\r",
+				atomic.LoadUint64(&totalTried), password, elapsed)
 		}
 	}
+
+	// If stopped externally
 	if atomic.LoadInt32(&stopSearch) != 0 {
 		c <- fmt.Sprintf("%d", finish-start)
 		return
 	}
+
+	// No key found
 	c <- ""
 }
-
 func searchRange(start, finish uint64, key *Key, charset string, pwlen int, pat []rune, c chan string) {
+	startTime := time.Now()
+
 	if key == nil || charset == "" || len(pat) == 0 || start > finish {
 		log.Fatal("Invalid input: nil key, empty charset, empty pattern, or invalid range")
 	}
@@ -90,8 +112,10 @@ func searchRange(start, finish uint64, key *Key, charset string, pwlen int, pat 
 		}
 		atomic.AddUint64(&totalTried, 1)
 		// Optional: Uncomment for throttled progress output
-		if i%100 == 0 {
-			fmt.Printf("%6d passphrases tried (latest guess: %s )                      \r", atomic.LoadUint64(&totalTried), guessString)
+		if atomic.LoadUint64(&totalTried)%1000 == 0 {
+			elapsed := time.Since(startTime).Truncate(time.Second)
+
+			fmt.Printf("%6d passphrases tried (latest guess: %s )  elapsed: %v \r", atomic.LoadUint64(&totalTried), guessString, elapsed)
 		}
 	}
 	if atomic.LoadInt32(&stopSearch) != 0 {
@@ -99,6 +123,39 @@ func searchRange(start, finish uint64, key *Key, charset string, pwlen int, pat 
 		return
 	}
 	c <- ""
+}
+
+func displayPerformance(routines int, spaceSize, resume uint64, startTime time.Time, fileMode bool, fileSize int64, avgLineLen int64) {
+	for atomic.LoadInt32(&stopSearch) == 0 {
+		time.Sleep(5 * time.Second) // Update every 5 seconds
+		tried := atomic.LoadUint64(&totalTried)
+		elapsed := time.Since(startTime).Seconds()
+		if elapsed < 1 {
+			continue // Avoid division by zero
+		}
+		rate := float64(tried) / elapsed
+		ratePerGoroutine := rate / float64(routines)
+		var b strings.Builder
+		b.Grow(256)
+		b.WriteString(fmt.Sprintf("\nPerformance: %d passphrases tried, %.2f passphrases/sec, %.2f passphrases/sec/goroutine\n",
+			tried, rate, ratePerGoroutine))
+		if !fileMode {
+			remaining := spaceSize - tried
+			if remaining > 0 {
+				eta := time.Duration(float64(remaining)/rate) * time.Second
+				b.WriteString(fmt.Sprintf("Remaining: %d passphrases, ETA: %v\n", remaining, eta.Truncate(time.Second)))
+			}
+		} else if fileSize > 0 && avgLineLen > 0 {
+			estimatedLines := uint64(fileSize / avgLineLen)
+			remaining := estimatedLines - tried
+			if remaining > 0 {
+				eta := time.Duration(float64(remaining)/rate) * time.Second
+				b.WriteString(fmt.Sprintf("Estimated remaining: %d passphrases (based on file size), ETA: %v\n",
+					remaining, eta.Truncate(time.Second)))
+			}
+		}
+		fmt.Print(b.String())
+	}
 }
 func BruteChunk(routines int, encryptedKey, charset, passwordFile string, pwlen int, pat string, chunk, chunks int, resume uint64, coinInfo [2]byte, coinName string) string {
 	if chunk < 0 || chunks <= 0 || chunk >= chunks {

@@ -95,7 +95,7 @@ var arguments map[string]interface{}
 func init() {
 	var err error
 
-	arguments, err = docopt.Parse(APP_USAGE, nil, true, APP_NAME, false)
+	arguments, err = docopt.ParseArgs(APP_USAGE, nil, APP_NAME)
 	if err != nil {
 		log.Fatal(err)
 	}
