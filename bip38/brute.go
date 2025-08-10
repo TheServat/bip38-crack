@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -125,38 +126,6 @@ func searchRange(start, finish uint64, key *Key, charset string, pwlen int, pat 
 	c <- ""
 }
 
-func displayPerformance(routines int, spaceSize, resume uint64, startTime time.Time, fileMode bool, fileSize int64, avgLineLen int64) {
-	for atomic.LoadInt32(&stopSearch) == 0 {
-		time.Sleep(5 * time.Second) // Update every 5 seconds
-		tried := atomic.LoadUint64(&totalTried)
-		elapsed := time.Since(startTime).Seconds()
-		if elapsed < 1 {
-			continue // Avoid division by zero
-		}
-		rate := float64(tried) / elapsed
-		ratePerGoroutine := rate / float64(routines)
-		var b strings.Builder
-		b.Grow(256)
-		b.WriteString(fmt.Sprintf("\nPerformance: %d passphrases tried, %.2f passphrases/sec, %.2f passphrases/sec/goroutine\n",
-			tried, rate, ratePerGoroutine))
-		if !fileMode {
-			remaining := spaceSize - tried
-			if remaining > 0 {
-				eta := time.Duration(float64(remaining)/rate) * time.Second
-				b.WriteString(fmt.Sprintf("Remaining: %d passphrases, ETA: %v\n", remaining, eta.Truncate(time.Second)))
-			}
-		} else if fileSize > 0 && avgLineLen > 0 {
-			estimatedLines := uint64(fileSize / avgLineLen)
-			remaining := estimatedLines - tried
-			if remaining > 0 {
-				eta := time.Duration(float64(remaining)/rate) * time.Second
-				b.WriteString(fmt.Sprintf("Estimated remaining: %d passphrases (based on file size), ETA: %v\n",
-					remaining, eta.Truncate(time.Second)))
-			}
-		}
-		fmt.Print(b.String())
-	}
-}
 func BruteChunk(routines int, encryptedKey, charset, passwordFile string, pwlen int, pat string, chunk, chunks int, resume uint64, coinInfo [2]byte, coinName string) string {
 	if chunk < 0 || chunks <= 0 || chunk >= chunks {
 		log.Fatal("Invalid chunk specification")
@@ -173,19 +142,24 @@ func BruteChunk(routines int, encryptedKey, charset, passwordFile string, pwlen 
 	if coinName == "" {
 		log.Fatal("Empty coinName")
 	}
+
 	key := NewKey(encryptedKey)
 	key.networkVersion = coinInfo[0]
 	key.privateKeyPrefix = coinInfo[1]
+
 	var b strings.Builder
-	b.Grow(256) // Estimate for config output
+	b.Grow(256)
+
 	if charset == "" && passwordFile == "" {
 		charset = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~."
 	}
+
 	if charset != "" {
 		b.WriteString("Using character set: ")
 		b.WriteString(charset)
 		b.WriteByte('\n')
 	}
+
 	b.WriteString("Encrypted key: ")
 	b.WriteString(encryptedKey)
 	b.WriteString("\nKeyType: ")
@@ -193,8 +167,10 @@ func BruteChunk(routines int, encryptedKey, charset, passwordFile string, pwlen 
 	b.WriteString("\nNetwork: ")
 	b.WriteString(coinName)
 	b.WriteByte('\n')
+
 	var spaceSize uint64
 	var patAsRunes []rune
+
 	if passwordFile == "" {
 		if pat == "" {
 			patAsRunes = make([]rune, pwlen)
@@ -221,92 +197,129 @@ func BruteChunk(routines int, encryptedKey, charset, passwordFile string, pwlen 
 		if csetLen == 0 {
 			log.Fatal("Empty charset")
 		}
+		// Calculate total search space efficiently:
 		spaceSize = 1
 		for i := 0; i < pwlen; i++ {
+			// Protect against overflow:
+			if spaceSize > math.MaxUint64/csetLen {
+				spaceSize = math.MaxUint64
+				break
+			}
 			spaceSize *= csetLen
 		}
 		b.WriteString("Total passphrase space size: ")
 		b.WriteString(strconv.FormatUint(spaceSize, 10))
 		b.WriteByte('\n')
 	} else {
-		// For file, we don't know spaceSize upfront; estimate or skip
-		spaceSize = math.MaxUint64 // Placeholder for chunking
+		// For password file, we treat spaceSize as max uint64 for chunking purposes
+		spaceSize = math.MaxUint64
 		b.WriteString("Password file: ")
 		b.WriteString(passwordFile)
 		b.WriteByte('\n')
 	}
+
 	fmt.Print(b.String())
-	startFrom := uint64(0)
+
+	// Calculate chunk and block sizes safely:
 	chunkSize := spaceSize / uint64(chunks)
-	blockSize := chunkSize / uint64(routines)
-	if chunks > 1 {
-		startFrom = chunkSize * uint64(chunk)
-		csz := chunkSize
-		if chunk == chunks-1 {
-			csz = spaceSize - startFrom
-		}
-		b.Reset()
-		b.WriteString("Chunk passphrase space size: ")
-		b.WriteString(strconv.FormatUint(csz, 10))
-		b.WriteString("  Starting from point: ")
-		b.WriteString(strconv.FormatUint(startFrom, 10))
-		b.WriteByte('\n')
-		fmt.Print(b.String())
+	startFrom := uint64(chunk) * chunkSize
+	if chunk == chunks-1 {
+		// Last chunk takes remainder
+		chunkSize = spaceSize - startFrom
 	}
+	blockSize := chunkSize / uint64(routines)
+
+	fmt.Printf("Chunk passphrase space size: %d  Starting from point: %d\n", chunkSize, startFrom)
+
 	totalTried = resume * uint64(routines)
+
 	c := make(chan string, routines)
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, os.Interrupt)
 	defer signal.Stop(sigc)
+
+	var wg sync.WaitGroup
+	wg.Add(routines)
+
+	// For graceful stopping:
+	done := make(chan struct{})
+	go func() {
+		<-sigc
+		atomic.StoreInt32(&stopSearch, 1)
+		close(done)
+		fmt.Println("\nReceived interrupt signal, stopping...")
+	}()
+
 	if passwordFile != "" {
 		file, err := os.Open(passwordFile)
 		if err != nil {
 			log.Fatalf("Failed to open password file: %v", err)
 		}
 		defer file.Close()
-		pwdChan := make(chan string, routines*100) // Buffer to reduce contention
+
+		pwdChan := make(chan string, routines*100) // Buffered to reduce contention
 		go func() {
 			defer close(pwdChan)
 			scanner := bufio.NewScanner(file)
-			scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // 64KB initial, 1MB max
-			for i := uint64(0); scanner.Scan() && atomic.LoadInt32(&stopSearch) == 0; i++ {
+			scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // 64KB initial, 1MB max buffer
+			i := uint64(0)
+			for scanner.Scan() {
+				if atomic.LoadInt32(&stopSearch) != 0 {
+					return
+				}
 				if i < startFrom+resume {
-					continue // Skip to resume point
+					i++
+					continue // Skip resume lines
 				}
 				pwdChan <- scanner.Text()
+				i++
 			}
 			if err := scanner.Err(); err != nil {
 				log.Printf("Error reading password file: %v", err)
 			}
 		}()
+
 		for i := 0; i < routines; i++ {
-			finish := uint64(i)*blockSize + blockSize + startFrom
-			if i == routines-1 {
-				finish = chunkSize + startFrom
-				if chunk == chunks-1 {
-					finish = spaceSize
+			go func(i int) {
+				defer wg.Done()
+				finish := startFrom + (uint64(i)+1)*blockSize
+				if i == routines-1 {
+					finish = startFrom + chunkSize
 				}
-			}
-			start := uint64(i)*blockSize + startFrom + resume
-			go tryPasswords(start, finish, key, pwdChan, c)
+				start := startFrom + uint64(i)*blockSize + resume
+				tryPasswords(start, finish, key, pwdChan, c)
+			}(i)
 		}
 	} else {
 		for i := 0; i < routines; i++ {
-			finish := uint64(i)*blockSize + blockSize + startFrom
-			if i == routines-1 {
-				finish = chunkSize + startFrom
-				if chunk == chunks-1 {
-					finish = spaceSize
+			go func(i int) {
+				defer wg.Done()
+				finish := startFrom + (uint64(i)+1)*blockSize
+				if i == routines-1 {
+					finish = startFrom + chunkSize
 				}
-			}
-			start := uint64(i)*blockSize + startFrom + resume
-			go searchRange(start, finish, key, charset, pwlen, patAsRunes, c)
+				start := startFrom + uint64(i)*blockSize + resume
+				searchRange(start, finish, key, charset, pwlen, patAsRunes, c)
+			}(i)
 		}
 	}
+
 	var minResumeKey uint64
-	for i := routines; i > 0; i-- {
+
+	go func() {
+		wg.Wait()
+		close(c)
+	}()
+
+	for {
 		select {
-		case s := <-c:
+		case s, ok := <-c:
+			if !ok {
+				if minResumeKey > 0 {
+					return fmt.Sprintf("to resume, use offset %d", minResumeKey)
+				}
+				return ""
+			}
 			if s == "" {
 				continue
 			}
@@ -319,16 +332,12 @@ func BruteChunk(routines int, encryptedKey, charset, passwordFile string, pwlen 
 				continue
 			}
 			return s
-		case sig := <-sigc:
-			atomic.StoreInt32(&stopSearch, 1)
-			fmt.Printf("\nReceived signal: %s\n", sig)
+		case <-done:
+			// Stop signal received
+			if minResumeKey > 0 {
+				return fmt.Sprintf("to resume, use offset %d", minResumeKey)
+			}
+			return "Stopped by user"
 		}
 	}
-	if minResumeKey > 0 {
-		b.Reset()
-		b.WriteString("to resume, use offset ")
-		b.WriteString(strconv.FormatUint(minResumeKey, 10))
-		return b.String()
-	}
-	return ""
 }
